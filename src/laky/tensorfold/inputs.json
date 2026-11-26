@@ -1,0 +1,84 @@
+{
+  "schema": "ds41f.tensorfold-public-inputs.v1",
+  "runtime_commit": "61357debe730ac9ffe20e760edcddbc253b0e525",
+  "cache_benchmark_commit": "c4844adfef8df07f2bd299a6a23e5d04a6ec43c0",
+  "files": {
+    "artifacts/kernel-files.json": {
+      "bytes": 107313,
+      "sha256": "165cf58ba3afcc8e6802f52b56f8b820a3ecbaa6a560c542d582194b03a579ba"
+    },
+    "artifacts/rope-reference-files.json": {
+      "bytes": 64436,
+      "sha256": "0da439b16ef81b1d046cc68125eb9c29a325efd365b36939b1cd6492bda176af"
+    },
+    "artifacts/source-files.json": {
+      "bytes": 172230,
+      "sha256": "23a208b0bf1a9a4d799bb4242b7c706e850cf029c6b6bc740b2f8d82963a08a0"
+    },
+    "artifacts/tensorfold-kernels.tar.gz": {
+      "bytes": 39844643,
+      "sha256": "3e94bac39a953165b05930fc9ef91c905f6238e92640fab3dd984973d761f341"
+    },
+    "artifacts/tensorfold-rope-reference.tar.gz": {
+      "bytes": 1188266,
+      "sha256": "3bb9295bd2809aa0c611082eac3d1e652abee166b804f741473f9010bd3d0405"
+    },
+    "artifacts/tensorfold-source.tar.gz": {
+      "bytes": 2025673,
+      "sha256": "8d4b2f808827fd247048082d122b8fab31b75e798b5ed86fd370103ef178469a"
+    },
+    "preparation/mia-selected.json": {
+      "bytes": 1526,
+      "sha256": "5109b87a48e49550fd05beb7f717f5d16f2535c8f2da7a6bfda84442f129ce94"
+    },
+    "preparation/mia-upstream-manifest.json": {
+      "bytes": 41698,
+      "sha256": "4930258d771fb81e25de82d7b10ff43944ed8c28f471c8dd24b1a2476ee532d2"
+    },
+    "preparation/pollard-selected.json": {
+      "bytes": 1565,
+      "sha256": "c1ea5d38cb7c533acb425aae9d26d4d37fb28ed47168bcc2ee08776ed619e8c9"
+    },
+    "preparation/pollard-upstream-manifest.json": {
+      "bytes": 20984,
+      "sha256": "e66ba06262449e04083ccf98beac690b35234a9c2a023a8c728087539de88ef5"
+    },
+    "preparation/rank0.keys": {
+      "bytes": 6598555,
+      "sha256": "eb4b06e874f8642da36384bcce0cd4681f4cbad37c1705766ed3c88ebb959dbb"
+    },
+    "preparation/rank1.keys": {
+      "bytes": 7025737,
+      "sha256": "4628ea178bd2ed4fef0ca4adef6385fef3c083e76819924746e09f4a5a4b4b62"
+    },
+    "preparation/rank2.keys": {
+      "bytes": 7167823,
+      "sha256": "047de1944e4562d499f6a4146788136d694a0861d562365a818ea9a2ed0b4206"
+    },
+    "preparation/TF29.json": {
+      "bytes": 34041890,
+      "sha256": "71214047821d46fc29cfa71395c38e70dd9b172376681c8e9c006e160a525e85"
+    },
+    "preparation/TF351.json": {
+      "bytes": 34805288,
+      "sha256": "8e0067ce580c43b7438ea6041715d489e96988f30f0137d20c650d6bcda3369a"
+    },
+    "hc-prefill/PATCH.json": {
+      "bytes": 1510,
+      "sha256": "a1a74168f017c1b4c965f823f73e2e2a9d8e4d4aa0ee665586051c654697375d"
+    },
+    "hc-prefill/COMPILE-CASES.json": {
+      "bytes": 6263,
+      "sha256": "4b259740799727c52380e764a33b5cfa25c6fe72f0f371d3100906a142a9746b"
+    },
+    "hc-prefill/COMPILE-PROVENANCE.json": {
+      "bytes": 3770,
+      "sha256": "269e3bfb5b16bb889d02c89e0915e71777fc300f3d78c9078e38613280dfc25a"
+    }
+  },
+  "hc_prefill_patch": {
+    "manifest": "hc-prefill/PATCH.json",
+    "date": "2026-10-14",
+    "aot_sha256": "d2a74f96ead50f86f7fcaab2905dee651bd6e27d3c831ee5c4fef1f07130b684"
+  }
+}

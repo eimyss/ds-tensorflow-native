@@ -1,0 +1,33 @@
+* text=auto eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.cu text eol=lf
+*.cuh text eol=lf
+
+experiments/20261012/sources/* -text -whitespace
+benchmarks/owen/owen-source.py -text
+benchmarks/owen/owen-fixture.json -text
+
+# Frozen hashes bind exact bytes across Windows/Linux checkouts.
+tensorfold/** -text -whitespace
+results/20261013-tensorfold/** -text -whitespace
+results/20261014-hermes-real-workload/** -text -whitespace
+results/20261014-hc-prefill/** -text -whitespace
+results/20261020-adaptive/** -text -whitespace
+results/20261020-adaptive/*.pdf binary
+results/20261021-workflow/** -text -whitespace
+benchmarks/workflow/** -text -whitespace
+
+# Gateway provenance binds production module bytes.
+gateway/laguna_gateway/*.py -text whitespace=trailing-space,space-before-tab,cr-at-eol
+benchmarks/sparkdash/vendor/** -text -whitespace
+results/20261023-sparkdash/** -text -whitespace
+results/20261023-1.2.5/** -text -whitespace
+results/20261024-1.2.6/** -text -whitespace
+
+results/20261028-1.2.7/** -text -whitespace
+
+results/20261030-1.2.8/** -text -whitespace
+
+results/20261031-4.0.0/** -text -whitespace

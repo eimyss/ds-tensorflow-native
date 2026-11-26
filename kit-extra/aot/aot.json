@@ -1,0 +1,165 @@
+{
+ "generator": "bake_extra_aot.py (launch shapes the merged kit lacks)",
+ "kernels": [
+  {
+   "fn": "_sparse_attn_part",
+   "hash": "75347c8c6589e4f9ac49908ec9ce660cce36f01ffbade8054079e5ae6832d338",
+   "name": "_sparse_attn_part",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 41472,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": true,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": true
+    },
+    {
+     "name": "WSRC",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": true
+    },
+    {
+     "name": "WLO",
+     "type": "*i64",
+     "div16": true,
+     "nospec": true
+    },
+    {
+     "name": "COMP",
+     "type": "*u8",
+     "div16": true,
+     "nospec": true
+    },
+    {
+     "name": "CSC",
+     "type": "*u8",
+     "div16": true,
+     "nospec": true
+    },
+    {
+     "name": "IDX",
+     "type": "*i64",
+     "div16": true,
+     "nospec": true
+    },
+    {
+     "name": "POS",
+     "type": "*i64",
+     "div16": true,
+     "nospec": true
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": true
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": true
+    },
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": true
+    },
+    {
+     "name": "SINK",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": true
+    },
+    {
+     "name": "OUT",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": true
+    },
+    {
+     "name": "scale",
+     "type": "fp32",
+     "div16": false,
+     "nospec": true
+    },
+    {
+     "name": "ring_size",
+     "type": "i32",
+     "div16": false,
+     "nospec": true
+    },
+    {
+     "name": "n_idx",
+     "type": "i32",
+     "div16": false,
+     "nospec": true
+    },
+    {
+     "name": "RBASE",
+     "type": "*i64",
+     "div16": true,
+     "nospec": true
+    },
+    {
+     "name": "CBASE",
+     "type": "*i64",
+     "div16": true,
+     "nospec": true
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 24
+    },
+    "HD": {
+     "int": 512
+    },
+    "HB": {
+     "int": 8
+    },
+    "WIN": {
+     "int": 128
+    },
+    "BN": {
+     "int": 32
+    },
+    "RING": {
+     "int": 1
+    },
+    "HAS_COMP": {
+     "int": 1
+    },
+    "PACKED": {
+     "int": 1
+    },
+    "SPLITS": {
+     "int": 8
+    },
+    "NBLK": {
+     "int": 20
+    },
+    "FINAL": {
+     "int": 0
+    },
+    "HAS_BASE": {
+     "int": 0
+    },
+    "PDL": {
+     "int": 1
+    },
+    "WPF": {
+     "int": 1
+    }
+   }
+  }
+ ]
+}

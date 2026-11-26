@@ -1,0 +1,13 @@
+.git
+config/cluster.local.json
+.env
+.cache
+.venv
+local-results
+results
+benchmarks
+tests
+docs
+**/__pycache__
+
+experiments

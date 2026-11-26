@@ -1,0 +1,859 @@
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/build/cuda.zig src/engine/zig/build/cuda.zig
+--- src/engine-baseline/zig/build/cuda.zig	2026-11-01 19:00:15.544878595 +0100
++++ src/engine/zig/build/cuda.zig	2026-11-02 02:03:56.094047097 +0100
+@@ -184,7 +184,9 @@
+     ds_lanes.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+     ds_lanes.addImport("cuda", cuda);
+     ds_lanes.addImport("lanes", mods.lanes);
+-    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-lanes", .root_module = ds_lanes }));
++    const ds_lanes_exe = b.addExecutable(.{ .name = "tf-dsv41-lanes", .root_module = ds_lanes });
++    b.installArtifact(ds_lanes_exe);
++    b.step("lanes", "tf-dsv41-lanes into zig-out/bin").dependOn(&b.addInstallArtifact(ds_lanes_exe, .{}).step);
+     _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.core, mods.tokenizer, build_options, true);
+ }
+ 
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/kernels/cuda/dsv41_ops.cu src/engine/zig/kernels/cuda/dsv41_ops.cu
+--- src/engine-baseline/zig/kernels/cuda/dsv41_ops.cu	2026-11-01 19:00:15.519472025 +0100
++++ src/engine/zig/kernels/cuda/dsv41_ops.cu	2026-11-01 18:39:12.000000000 +0100
+@@ -19,6 +19,18 @@
+          i += uint64_t(gridDim.x) * blockDim.x) output[i] = __float2bfloat16_rn(__fadd_rn(g0[i], g1[i]));
+ }
+ 
++// Comm.sum of `world` ranks' fp32 partials, then `.to(bf16)`: acc = g[0] + g[1] + ... in rank order (each add fp32,
++// as the two-rank kernel), rounded once into bf16. `plane` is the stride between ranks in elements.
++extern "C" __global__ void tf_ds_addn_bf16_kernel(const float* g, int world, uint64_t plane, __nv_bfloat16* output,
++                                                  uint64_t count) {
++    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
++         i += uint64_t(gridDim.x) * blockDim.x) {
++        float acc = g[i];
++        for (int r = 1; r < world; ++r) acc = __fadd_rn(acc, g[uint64_t(r) * plane + i]);
++        output[i] = __float2bfloat16_rn(acc);
++    }
++}
++
+ // A profile's GPU clock (ns, %globaltimer) when the stream reaches it, appended with its tag: buf[0] the count (reset
+ // first when `reset`), then (clock, tag) pairs, at most `cap` (round phase timing; in a graph like any kernel).
+ extern "C" __global__ void tf_ds_clock_kernel(uint64_t* buf, uint32_t tag, uint32_t reset, uint32_t cap) {
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/cuda/aot.zig src/engine/zig/src/cuda/aot.zig
+--- src/engine-baseline/zig/src/cuda/aot.zig	2026-11-01 19:00:15.496878864 +0100
++++ src/engine/zig/src/cuda/aot.zig	2026-11-02 01:55:43.110996400 +0100
+@@ -113,6 +113,30 @@
+             if (matches(v.spec, args, consts, true)) return v;
+         }
+         std.log.err("no captured Triton variant of {s} for this launch:", .{function});
++        for (consts) |c| std.log.err("  const {s}: int={any} f32={any}", .{ c.name, c.int, c.f32 });
++        for (self.variants) |*v| {
++            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
++            const gH = v.spec.consts.map.get("H");
++            const gHB = v.spec.consts.map.get("HB");
++            const gHD = v.spec.consts.map.get("HD");
++            const gRD = v.spec.consts.map.get("RD");
++            const gINV = v.spec.consts.map.get("INV");
++            const gPDL = v.spec.consts.map.get("PDL");
++            std.log.err("  have {s} np={d} H={any} HB={any} HD={any} RD={any} INV={any} PDL={any}", .{ v.spec.name, v.spec.params.len, if (gH) |g| g.int else null, if (gHB) |g| g.int else null, if (gHD) |g| g.int else null, if (gRD) |g| g.int else null, if (gINV) |g| g.int else null, if (gPDL) |g| g.int else null });
++            if (gH != null and gH.?.int == 24) {
++                for (v.spec.params) |pp| {
++                    const aa = lookup(args, pp.name);
++                    if (aa) |a2| switch (a2.value) {
++                        .ptr => |xx| std.log.err("    TRACE {s}: ktype={s} atype={s} div16={} aligned={}", .{ pp.name, pp.type, xx.ty, pp.div16, xx.addr % 16 == 0 }),
++                        else => std.log.err("    TRACE {s}: nonptr", .{pp.name}),
++                    } else std.log.err("    TRACE {s}: NO ARG", .{pp.name});
++                }
++                for (consts) |c| {
++                    const got = v.spec.consts.map.get(c.name);
++                    std.log.err("    TRACE const {s}: want={any} got={any}", .{ c.name, c.int, if (got) |g| g.int else null });
++                }
++            }
++        }
+         for (args) |a| switch (a.value) {
+             .ptr => |p| std.log.err("  {s}: {s} at {x} (16-aligned {})", .{ a.name, p.ty, p.addr, p.addr % 16 == 0 }),
+             .i32 => |x| std.log.err("  {s}: i32 {d}", .{ a.name, x }),
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/check_main.zig src/engine/zig/src/families/dsv41/check_main.zig
+--- src/engine-baseline/zig/src/families/dsv41/check_main.zig	2026-11-01 19:00:15.459723073 +0100
++++ src/engine/zig/src/families/dsv41/check_main.zig	2026-11-01 18:59:21.000000000 +0100
+@@ -30,6 +30,7 @@
+         }
+     }
+     const cfg = try dsv41.Config.read(a, io, args[1]);
++    try cfg.checkWorld(world);
+     var dir = try std.Io.Dir.cwd().openDir(io, args[2], .{ .iterate = true });
+     defer dir.close(io);
+     const name = try dsv41.rank_cache.find(a, io, dir, rank, world);
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/checkpoint.zig src/engine/zig/src/families/dsv41/checkpoint.zig
+--- src/engine-baseline/zig/src/families/dsv41/checkpoint.zig	2026-11-01 19:00:15.544878595 +0100
++++ src/engine/zig/src/families/dsv41/checkpoint.zig	2026-11-01 19:35:29.000000000 +0100
+@@ -234,24 +234,40 @@
+         return error.UnsupportedConversion;
+     }
+     if (k.native()) |np| {
+-        // rows [c0, c1) of dim 0, columns [r0, r1) of dim 1, in the part's units
++        // rows [c0, c1) of dim 0, columns [r0, r1) of dim 1, in the part's units. A requested range may run past the
++        // checkpoint's tensor (a padded TP3 checkpoint: heads 64..71, o_groups 8, vocab 129,280..129,408): those
++        // bytes are zeros, so the padded tail can never contribute.
+         const dv = np.div();
+         const es = (try dtypeOf(t.dtype)).size();
+         const row = t.dim(1) * es;
+         const r0 = if (k.cols) |c| c[0] / dv[0] else 0;
+         const nr = want.shape[0];
+-        const c0 = (if (k.rows) |r| r[0] / dv[1] else 0) * es;
+-        const w = want.shape[1] * es;
++        const nc = want.shape[1];
++        const c0 = if (k.rows) |r| r[0] / dv[1] else 0;
++        const w = nc * es;
++        const src_rows = t.dim(0);
++        const src_cols = if (np == .t4) t.dim(1) / 2 else t.dim(1); // NVFP4 scales: two per 32-value block
++        const valid_n = if (r0 >= src_rows) 0 else @min(nr, src_rows - r0);
++        const valid_c = if (c0 >= src_cols) 0 else @min(nc, src_cols - c0);
++        // The padded 9th wo_a group is a byte-copy of group 0: the HC normalization needs a real group, and its
++        // contribution is silenced by wo_b's zeroed input rows. Every other past-the-end range is zeros.
++        if (std.mem.endsWith(u8, k.name, ".attn.wo_a") and r0 >= src_rows) {
++            const rows = @min(nr, src_rows);
++            for (0..rows) |i| @memcpy(out[i * w ..][0 .. valid_c * es], t.bytes[i * row + c0 * es ..][0 .. valid_c * es]);
++            return;
++        }
++        @memset(out, 0);
+         if (np == .t4) {
+             // the pairs of per-16 scales, each one byte per 32; a pair that differs is not this kernel's checkpoint
+-            for (0..nr) |i| for (0..w) |j| {
++            for (0..valid_n) |i| for (0..valid_c) |j| {
+                 const pair = t.bytes[(r0 + i) * row + 2 * (c0 + j) ..][0..2];
+                 if (pair[0] != pair[1]) return error.UnequalScalePair;
+                 out[i * w + j] = pair[0];
+             };
+             return;
+         }
+-        for (0..nr) |i| @memcpy(out[i * w ..][0..w], t.bytes[(r0 + i) * row + c0 ..][0..w]);
++        if (valid_n == 0 or valid_c == 0) return;
++        for (0..valid_n) |i| @memcpy(out[i * w ..][0 .. valid_c * es], t.bytes[(r0 + i) * row + c0 * es ..][0 .. valid_c * es]);
+         return;
+     }
+     const es = (try dtypeOf(t.dtype)).size();
+@@ -341,6 +357,99 @@
+     try std.testing.expectEqual(@as(u32, std.mem.readInt(u16, body[6276..6278], .little)) << 16, std.mem.readInt(u32, gf[0..4], .little));
+ }
+ 
++test "native slices past the tensor are zero: the padded TP3 tail" {
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    // a.weight [64,64] F8_E4M3, a.scale [2,2] F8_E8M0, b.weight [64,32] I8 (K 64), b.scale [64,2] F8_E8M0, g [4,2] BF16
++    var body: [4096 + 4 + 2048 + 128 + 16]u8 = undefined;
++    for (&body, 0..) |*x, i| x.* = @truncate(i *% 7 +% i / 256);
++    const json = "{\"a.weight\":{\"dtype\":\"F8_E4M3\",\"shape\":[64,64],\"data_offsets\":[0,4096]}," ++
++        "\"a.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[2,2],\"data_offsets\":[4096,4100]}," ++
++        "\"b.weight\":{\"dtype\":\"I8\",\"shape\":[64,32],\"data_offsets\":[4100,6148]}," ++
++        "\"b.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[64,2],\"data_offsets\":[6148,6276]}," ++
++        "\"g.weight\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[6276,6292]}}";
++    var file: std.ArrayList(u8) = .empty;
++    defer file.deinit(a);
++    var len: [8]u8 = undefined;
++    std.mem.writeInt(u64, &len, json.len, .little);
++    try file.appendSlice(a, &len);
++    try file.appendSlice(a, json);
++    try file.appendSlice(a, &body);
++    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001-of-00001.safetensors", .data = file.items });
++    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++    defer a.free(dir);
++    var sh = try Shards.open(a, io, dir);
++    defer sh.close(io);
++    // w8 rows 32..96 of a [64, 64] tensor: 32 real rows, then 32 rows of zeros
++    var w: [64 * 64]u8 = undefined;
++    try read(&sh, "a|(32, 96)|None|w8", &w);
++    for (0..32) |i| try std.testing.expectEqualSlices(u8, body[(32 + i) * 64 ..][0..64], w[i * 64 ..][0..64]);
++    for (32..64) |i| for (w[i * 64 ..][0..64]) |x| try std.testing.expectEqual(@as(u8, 0), x);
++    // its scales: requested rows 32..96 of N are one real 32-block then one zero block
++    var sc: [2 * 2]u8 = undefined;
++    try read(&sh, "a|(32, 96)|None|s8", &sc);
++    try std.testing.expectEqualSlices(u8, body[4096 + 2 ..][0..2], sc[0..2]);
++    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0 }, sc[2..4]);
++    // FP4 K 32..96 of rows 0..32: 16 real packed bytes a row, then 16 zeros
++    var w4: [32 * 32]u8 = undefined;
++    try read(&sh, "b|(0, 32)|(32, 96)|w4", &w4);
++    for (0..32) |i| {
++        try std.testing.expectEqualSlices(u8, body[4100 + i * 32 + 16 ..][0..16], w4[i * 32 ..][0..16]);
++        for (w4[i * 32 + 16 ..][0..16]) |x| try std.testing.expectEqual(@as(u8, 0), x);
++    }
++    // its scales: K/32 = 1 real column then one zero
++    var s4: [32 * 2]u8 = undefined;
++    try read(&sh, "b|(0, 32)|(32, 96)|s4", &s4);
++    for (0..32) |i| {
++        try std.testing.expectEqual(body[6148 + i * 2 + 1], s4[i * 2]);
++        try std.testing.expectEqual(@as(u8, 0), s4[i * 2 + 1]);
++    }
++    // bf16 rows 2..6 of [4, 2]: two real rows, two zero rows
++    var g: [4 * 2 * 2]u8 = undefined;
++    try read(&sh, "g|(2, 6)|None|bf", &g);
++    try std.testing.expectEqualSlices(u8, body[6276 + 8 ..][0..8], g[0..8]);
++    const zeros: [8]u8 = @splat(0);
++    try std.testing.expectEqualSlices(u8, &zeros, g[8..16]);
++}
++
++test "a padded wo_a group copies group 0; other past-the-end ranges are zero" {
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    // wo_a.weight [64,64] F8, wo_a.scale [2,2], wq_b.weight [64,64] F8 (a non-wo_a control)
++    var body: [4096 + 4 + 4096]u8 = undefined;
++    for (&body, 0..) |*x, i| x.* = @truncate(i *% 11 +% i / 256);
++    const json = "{\"layers.0.attn.wo_a.weight\":{\"dtype\":\"F8_E4M3\",\"shape\":[64,64],\"data_offsets\":[0,4096]}," ++
++        "\"layers.0.attn.wo_a.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[2,2],\"data_offsets\":[4096,4100]}," ++
++        "\"layers.0.attn.wq_b.weight\":{\"dtype\":\"F8_E4M3\",\"shape\":[64,64],\"data_offsets\":[4100,8196]}}";
++    var file: std.ArrayList(u8) = .empty;
++    defer file.deinit(a);
++    var len: [8]u8 = undefined;
++    std.mem.writeInt(u64, &len, json.len, .little);
++    try file.appendSlice(a, &len);
++    try file.appendSlice(a, json);
++    try file.appendSlice(a, &body);
++    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001-of-00001.safetensors", .data = file.items });
++    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++    defer a.free(dir);
++    var sh = try Shards.open(a, io, dir);
++    defer sh.close(io);
++    // group 8 of a 9-group tensor is past the source's 8 groups: copy group 0's rows and scales
++    var w: [32 * 64]u8 = undefined;
++    try read(&sh, "layers.0.attn.wo_a|(64, 96)|None|w8", &w);
++    for (0..32) |i| try std.testing.expectEqualSlices(u8, body[i * 64 ..][0..64], w[i * 64 ..][0..64]);
++    var s: [2]u8 = undefined;
++    try read(&sh, "layers.0.attn.wo_a|(64, 96)|None|s8", &s);
++    try std.testing.expectEqualSlices(u8, body[4096..4098], &s);
++    // the same past-the-end slice of a non-wo_a tensor is zeros
++    var z: [32 * 64]u8 = undefined;
++    try read(&sh, "layers.0.attn.wq_b|(64, 96)|None|w8", &z);
++    for (z) |x| try std.testing.expectEqual(@as(u8, 0), x);
++}
++
+ test "loader keys parse as Python prints them" {
+     const p = try Key.parse("layers.3.ffn.experts.17.w2|None|(1152, 2304)|tr");
+     try std.testing.expect(p.exl3 and p.cols == null and p.rows.?[0] == 1152 and p.rows.?[1] == 2304);
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/config.zig src/engine/zig/src/families/dsv41/config.zig
+--- src/engine-baseline/zig/src/families/dsv41/config.zig	2026-11-01 19:00:15.544953267 +0100
++++ src/engine/zig/src/families/dsv41/config.zig	2026-11-01 18:38:26.000000000 +0100
+@@ -103,6 +103,29 @@
+     eos: u32,
+     image_token: ?u32 = null,
+     vision: bool = false,
++    /// Nonzero only for the physically padded TP3 config: the real vocabulary the
++    /// tokenizer and the sampler use; `vocab` is the padded stride (129,408).
++    logical_vocab: usize = 0,
++
++    /// The tokenizer's / sampler's vocabulary (the logical one on a padded config).
++    pub fn tokenVocab(c: Config) usize {
++        return if (c.logical_vocab != 0) c.logical_vocab else c.vocab;
++    }
++
++    /// A padded config is only legal at world 3, and world 3 needs one.
++    pub fn checkWorld(c: Config, world: usize) !void {
++        if (c.logical_vocab != 0 and world != 3) return error.PaddedCheckpointNeedsTP3;
++        if (world == 3 and c.logical_vocab == 0) return error.TP3NeedsPaddedCheckpoint;
++    }
++
++    /// Mask the padded token ids of a host logits row (`values.len` a multiple of `vocab`).
++    pub fn maskHostLogits(c: Config, values: []f32) void {
++        std.debug.assert(values.len % c.vocab == 0);
++        if (c.tokenVocab() == c.vocab) return;
++        var row: usize = 0;
++        while (row < values.len) : (row += c.vocab)
++            @memset(values[row + c.tokenVocab() .. row + c.vocab], -std.math.inf(f32));
++    }
+ 
+     /// `dir`/config.json.
+     pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Config {
+@@ -247,6 +270,24 @@
+         c.image_token = @intCast(v.integer);
+     };
+     c.vision = top.get("vision_config") != null;
++    // A physically padded TP3 checkpoint (heads 64 -> 72, o_groups 8 -> 9,
++    // vocab 129,280 -> 129,408). The marker is written beside the padded
++    // config.json; the logical sizes stay the tokenizer's and sampler's.
++    if (top.get("tensorfold_tp3")) |marker| {
++        if (marker != .object) return error.BadTP3Metadata;
++        const m = marker.object;
++        if (try int(m, "schema") != 1 or try int(m, "world_size") != 3 or
++            try int(m, "logical_vocab_size") != 129280 or
++            try int(m, "logical_num_attention_heads") != 64 or
++            try int(m, "logical_o_groups") != 8)
++            return error.BadTP3Metadata;
++        if (m.get("padding_group_source")) |v| {
++            if (v != .integer or v.integer != 0) return error.BadTP3Metadata;
++        }
++        const mask = m.get("requires_logical_vocab_mask") orelse return error.BadTP3Metadata;
++        if (mask != .bool or !mask.bool) return error.BadTP3Metadata;
++        c.logical_vocab = 129280;
++    }
+     return c;
+ }
+ 
+@@ -296,15 +337,19 @@
+ 
+ /// The shapes the served kernels and our TP2 split (DESIGN.md section 2) are built for.
+ pub fn checkShapes(c: Config, why: *Why) !void {
+-    const ok = c.layers == 40 and c.draft_layers == 3 and c.hidden == 5120 and c.vocab == 129280 and c.heads == 64 and
+-        c.head_dim == 512 and c.rope_dim == 64 and c.q_lora == 1280 and c.o_lora == 1024 and c.o_groups == 8 and
++    const layout_ok = if (c.logical_vocab == 0)
++        c.vocab == 129280 and c.heads == 64 and c.o_groups == 8
++    else
++        c.logical_vocab == 129280 and c.vocab == 129408 and c.heads == 72 and c.o_groups == 9;
++    const ok = layout_ok and c.layers == 40 and c.draft_layers == 3 and c.hidden == 5120 and
++        c.head_dim == 512 and c.rope_dim == 64 and c.q_lora == 1280 and c.o_lora == 1024 and
+         c.window == 128 and c.experts == 384 and c.top_k == 6 and c.expert_width == 2304 and c.shared_experts == 1 and
+         c.index_heads == 32 and c.index_head_dim == 128 and c.index_topk == 512 and c.candidate_blocks == 2048 and
+         c.candidate_block == 8 and c.hc == 4 and c.engram_layers.len == 2 and c.engram_heads == 8 and
+         c.engram_head_dim == 256 and c.dspark_block == 5 and c.markov_rank == 256 and c.draft_experts == 128 and
+         c.draft_top_k == 3;
+     if (!ok) {
+-        why.set("these DeepSeek-V4.1 shapes differ from the ones the served kernels and the TP2 split were built for", .{});
++        why.set("these DeepSeek-V4.1 shapes differ from the ones the served kernels and the TP2/TP3 split were built for", .{});
+         return error.UnsupportedShapes;
+     }
+ }
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/draft.zig src/engine/zig/src/families/dsv41/draft.zig
+--- src/engine-baseline/zig/src/families/dsv41/draft.zig	2026-11-01 19:00:15.547204324 +0100
++++ src/engine/zig/src/families/dsv41/draft.zig	2026-11-01 18:40:03.000000000 +0100
+@@ -860,6 +860,17 @@
+         dd(e, "xn", 0, dr.xn, R * d * 2);
+         const head = dr.ds.head8 orelse e.w.head; // the drafter's FP8 copy (weights.DSpark.head8), else the backbone's
+         try prompt.groupedDecode(e, ch, R, &.{head}, &.{dr.xn}, &.{d}, &.{dr.local}, &.{head.n}, &.{.f32});
++        // A padded TP3 vocabulary's ids (>= logical vocab) must never win the Markov draft, even when every valid
++        // logit is negative: zero weights alone are insufficient.
++        if (c.logical_vocab != 0) {
++            const width: usize = head.n;
++            const start = @as(usize, e.comm.rank) * width;
++            const valid = @min(width, c.tokenVocab() -| start);
++            if (valid < width) for (0..R) |r| {
++                try e.d.check(e.d.api.cuMemsetD32Async(dr.local + (r * width + valid) * 4,
++                    0xff800000, width - valid, e.s.handle), "TP3 draft vocab mask");
++            };
++        }
+         try Probe.check(probe, .local, S, dr.local);
+         pmark(e, .head);
+         // the Markov loop: out [N, steps + 1], each stream's last token first
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/load_main.zig src/engine/zig/src/families/dsv41/load_main.zig
+--- src/engine-baseline/zig/src/families/dsv41/load_main.zig	2026-11-01 19:00:15.492069470 +0100
++++ src/engine/zig/src/families/dsv41/load_main.zig	2026-11-01 18:59:21.000000000 +0100
+@@ -34,6 +34,7 @@
+         } else if (std.mem.eql(u8, args[i], "--parity")) parity = true;
+     }
+     const cfg = try dsv41.Config.read(a, io, args[1]);
++    try cfg.checkWorld(world);
+     var split = try dsv41.prompt2d.split(rank, world);
+     split.parity = split.pair != null and parity;
+     var driver = try cuda.Driver.open();
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/model.zig src/engine/zig/src/families/dsv41/model.zig
+--- src/engine-baseline/zig/src/families/dsv41/model.zig	2026-11-01 19:00:15.545007235 +0100
++++ src/engine/zig/src/families/dsv41/model.zig	2026-11-01 18:38:34.000000000 +0100
+@@ -182,7 +182,7 @@
+     /// and sets up every buffer. Needs `ctx` current on this thread.
+     pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, o: Options) !*Model {
+         readWorkerEnv();
+-        if (o.world != 2 and o.world != 4) return error.NotPortedYet; // TP2, or the four-node 2D split (prompt2d.zig)
++        if (o.world != 2 and o.world != 3 and o.world != 4) return error.NotPortedYet; // TP2, plain TP3, or the four-node 2D split (prompt2d.zig)
+         const m = try gpa.create(Model);
+         errdefer gpa.destroy(m);
+         m.* = undefined;
+@@ -237,6 +237,7 @@
+         m.rdma_rings = null;
+         const d = ctx.d;
+         m.cfg = try Config.read(a, io, o.model_dir);
++        try m.cfg.checkWorld(o.world);
+         const c = &m.cfg;
+         m.stream = try cuda.Stream.init(d, true);
+         errdefer m.stream.deinit();
+@@ -991,7 +992,7 @@
+     /// The round's greedy tokens, R rows (the device's argmax of the round's logits, as sampling.argmax), on the host.
+     pub fn roundArgmax(m: *Model, R: usize) ![]const u32 {
+         const d = m.ctx.d;
+-        try m.ops.argmaxRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, m.amax);
++        try m.ops.argmaxRows(m.stream, m.rd.logits, m.vocab, m.cfg.tokenVocab(), R, m.amax);
+         try m.stream.synchronize();
+         try d.check(d.api.cuMemcpyDtoH_v2(&m.amax_host, m.amax, R * 4), "cuMemcpyDtoH");
+         return m.amax_host[0..R];
+@@ -1005,7 +1006,7 @@
+         const vals = m.cand;
+         const ids = m.cand + round.max_rows * mc * 4;
+         const flags = ids + round.max_rows * mc * 8;
+-        try m.ops.topCandRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, count, vals, ids, flags);
++        try m.ops.topCandRows(m.stream, m.rd.logits, m.vocab, m.cfg.tokenVocab(), R, count, vals, ids, flags);
+         try m.stream.synchronize();
+         try d.check(d.api.cuMemcpyDtoH_v2(&m.cand_vals, vals, R * count * 4), "cuMemcpyDtoH");
+         try d.check(d.api.cuMemcpyDtoH_v2(&m.cand_ids, ids, R * count * 8), "cuMemcpyDtoH");
+@@ -1017,6 +1018,7 @@
+         const d = m.ctx.d;
+         try m.stream.synchronize();
+         try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.rd.logits, R * m.vocab * 4), "cuMemcpyDtoH");
++        m.cfg.maskHostLogits(m.logits[0 .. R * m.vocab]);
+         return m.logits[0 .. R * m.vocab];
+     }
+ 
+@@ -1025,6 +1027,7 @@
+         const d = m.ctx.d;
+         try m.stream.synchronize();
+         try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.ch.head_g, m.vocab * 4), "cuMemcpyDtoH");
++        m.cfg.maskHostLogits(m.logits[0..m.vocab]);
+         return m.logits[0..m.vocab];
+     }
+ 
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/native.zig src/engine/zig/src/families/dsv41/native.zig
+--- src/engine-baseline/zig/src/families/dsv41/native.zig	2026-11-01 19:00:15.536441888 +0100
++++ src/engine/zig/src/families/dsv41/native.zig	2026-11-01 18:38:34.000000000 +0100
+@@ -119,7 +119,7 @@
+ /// positions (else `o.context`), a stream at most `o.context`. Needs `ctx` current.
+ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
+     const world = std.fmt.parseInt(u32, getenv("TF_TP_WORLD") orelse "2", 10) catch return error.BadWorld;
+-    if (world != 2 and world != 4) return error.NotPortedYet; // TP2, or the four-node 2D split
++    if (world != 2 and world != 3 and world != 4) return error.NotPortedYet; // TP2, plain TP3, or the four-node 2D split
+     const master = link.parseIp(getenv("TF_TP_MASTER") orelse return error.NoMaster) catch return error.BadMaster;
+     const port = std.fmt.parseInt(u16, getenv("TF_TP_PORT") orelse "29620", 10) catch return error.BadPort;
+     const listen: ?[3][4]u8 = if (getenv("TF_TP_LISTEN")) |t| blk: {
+@@ -189,7 +189,7 @@
+ /// A request or a start this engine refuses, in words; null: none of its own.
+ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+     return switch (err) {
+-        error.NotPortedYet => "the native DeepSeek-V4.1 engine runs tensor parallel over two GPUs or the four nodes of the 2D split: set TF_TP_WORLD=2 or 4",
++        error.NotPortedYet => "the native DeepSeek-V4.1 engine runs tensor parallel over two GPUs, three nodes (padded TP3), or the four nodes of the 2D split: set TF_TP_WORLD=2, 3 or 4",
+         error.NoMaster, error.BadMaster => "set TF_TP_MASTER to rank 0's fabric address (rank 1: tf-dsv41-lanes MODEL CACHE 1 2 MASTER PORT KIT; ranks 1-3 of four: ... G 4 ...)",
+         error.NoRdmaKernels => "TF_RDMA_DEVICES at world 4 needs TF_DS_RDMA_KERNELS (rdma_gather.cu's fatbin) in a build without the kernel images",
+         error.NoRankCache => "set TF_DS_RANK_CACHE to the lane's per-rank weight files",
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/ops.zig src/engine/zig/src/families/dsv41/ops.zig
+--- src/engine-baseline/zig/src/families/dsv41/ops.zig	2026-11-01 19:00:15.519537049 +0100
++++ src/engine/zig/src/families/dsv41/ops.zig	2026-11-01 18:39:19.000000000 +0100
+@@ -26,6 +26,7 @@
+     to_f32: cuda.Function,
+     f16_to_f32: cuda.Function,
+     add2_bf16: cuda.Function,
++    addn_bf16: cuda.Function,
+     topk_i64: cuda.Function,
+     topk_indices: cuda.Function,
+     scatter: cuda.Function,
+@@ -61,6 +62,7 @@
+             .to_f32 = try pw.function("tf_bf16_to_f32_kernel"),
+             .f16_to_f32 = try fm.function("tf_ds_f16_to_f32_kernel"),
+             .add2_bf16 = try fm.function("tf_ds_add2_bf16_kernel"),
++            .addn_bf16 = try fm.function("tf_ds_addn_bf16_kernel"),
+             .topk_i64 = try fm.function("tf_ds_topk_i64_kernel"),
+             .topk_indices = try fm.function("tf_ds_topk_indices_kernel"),
+             .scatter = try fm.function("tf_ds_scatter_rows_kernel"),
+@@ -125,6 +127,20 @@
+         try go(o.add2_bf16, s, blocks(count, 256), 256, &a);
+     }
+ 
++    /// Comm.sum of `world` ranks' fp32 partials then `.to(bf16)`: out = bf16(g[0] + g[1] + ... in rank order),
++    /// each add fp32, rounded once. `plane` is the stride between ranks in elements.
++    pub fn addNBf16(o: *const Ops, s: cuda.Stream, g: u64, world: usize, plane: usize, out: u64, count: usize) !void {
++        if (count == 0 or world == 0) return;
++        if (world == 2) return o.add2Bf16(s, g, g + plane * 4, out, count);
++        var a: cuda.Args = .{};
++        a.add(g);
++        a.add(@as(c_int, @intCast(world)));
++        a.add(@as(u64, plane));
++        a.add(out);
++        a.add(@as(u64, count));
++        try go(o.addn_bf16, s, blocks(count, 256), 256, &a);
++    }
++
+     /// keys.topk(k, sorted=False).values of unique int64 keys [rows, n] (row stride ks) into top [rows, k], the set in no
+     /// particular order (_topk_finish sorts the indices).
+     pub fn topkI64(o: *const Ops, s: cuda.Stream, keys: u64, ks: usize, rows: usize, n: usize, k: usize, top: u64) !void {
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/prompt.zig src/engine/zig/src/families/dsv41/prompt.zig
+--- src/engine-baseline/zig/src/families/dsv41/prompt.zig	2026-11-01 19:00:15.545059923 +0100
++++ src/engine/zig/src/families/dsv41/prompt.zig	2026-11-02 10:42:55.351695115 +0100
+@@ -242,10 +242,6 @@
+     ga: u64, // fp32 [world, cap, D]: its gather
+     neg: u64, // int64 [cap], -1: no ring slot (model.py _neg)
+     ring_idx: u64, // int64 [ring]
+-    rslot: u64 = 0, // int64 [RING_EXTRA]: ring mode's slots, pos % R
+-    pm_: u64 = 0, // fp32 [16, heads, 8]: the split attention's partials (ring mode's rows)
+-    pl_: u64 = 0,
+-    po_: u64 = 0, // fp32 [16, heads, 8, head_dim]
+     invalid: u64, // uint32 [1]
+     // compressed layers
+     kvc: u64 = 0, // fp32 [cap, head_dim]: the compressor's kv projection
+@@ -371,10 +367,6 @@
+         ch.ga = try a.take(e.world * cap * d * 4);
+         ch.neg = try a.take(cap * 8);
+         ch.ring_idx = try a.take((c.window + ring_extra) * 8);
+-        ch.rslot = try a.take(ring_extra * 8);
+-        ch.pm_ = try a.take(ring_extra * hl * tri_attn.attn_splits * 4);
+-        ch.pl_ = try a.take(ring_extra * hl * tri_attn.attn_splits * 4);
+-        ch.po_ = try a.take(ring_extra * hl * tri_attn.attn_splits * hd * 4);
+         ch.invalid = try a.take(4);
+         ch.xf = try a.take(cap * d * 4);
+         ch.gate_f = try a.take(c.experts * d * 4);
+@@ -1021,8 +1013,6 @@
+     // _cs: the layer's RoPE kind (compressed layers rotate by the compressed table) for every rotation it makes
+     const rope = if (lay.ratio != 0) e.compressed else e.plain;
+     const ring_rows = c.window + ring_extra;
+-    // ring mode (a chunk of RING_EXTRA rows or fewer): the rows' keys into the ring first, the attention reads the ring
+-    const ring_mode = n <= ring_extra;
+     // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to 128 rows
+     if (n > 128) {
+         try mm(e, ch, lay.wq_a, ch.x, c.hidden, ch.qa, .bf16, lay.wq_a.n);
+@@ -1040,16 +1030,14 @@
+     dump(e, li, "q_norope", ch.q, n * hl * hd * 2);
+     try tri_norm.ropeHeads(e.t, ch.q, rope.cos, rope.sin, ch.pos, rd, false, n, hl, hd);
+     pmark(e, .a_q);
+-    // the window keys: the ring's last window - 1 positions before start, then this chunk's rows
++    // the window keys: the ring's last window - 1 positions before start, then this chunk's rows. A chunk always
++    // gathers them here and writes its keys to wsrc (then scatters them into the ring after the attention), however
++    // few rows it has: the round path's read-the-ring-directly shape is a round's, and a prompt chunk -- including the
++    // 1..RING_EXTRA-row tail a prefill can leave -- launches the one specialization the chunk path has (see
++    // tp3-changes.patch and kit-extra/).
+     const lo = @max(floor, start -| (c.window - 1));
+-    const wsrc_rows = if (ring_mode) ring_rows else start - lo + n;
+-    if (ring_mode) {
+-        // kv_norm_rope into ring rows pos % R (and its rows out), the attention's window keys the ring, WLO zero
+-        var slots: [ring_extra]i64 = undefined;
+-        for (0..n) |j| slots[j] = @intCast((start + j) % ring_rows);
+-        try upload(e, ch.rslot, &slots, n * 8);
+-        try tri_norm.kvNormRope(e.t, ch.y, lay.kv_norm, rope.cos, rope.sin, ch.pos, ring, ring_rows, ch.rslot, c.eps, true, rd, ch.wsrc, n, hd);
+-    } else if (start > lo) {
++    const wsrc_rows = start - lo + n;
++    if (start > lo) {
+         // wsrc[:start - lo] = ring[arange(lo, start) % R]
+         var ridx: [256]i64 = undefined;
+         if (start - lo > ridx.len) return error.WindowTooLong;
+@@ -1058,11 +1046,11 @@
+         try fill(e, ch.invalid, 0, 4);
+         try e.ops.gatherRows(e.s, ring, ring_rows, ch.ring_idx, ch.wsrc, hd * 2, start - lo, ch.invalid);
+     }
+-    var lo64: i64 = if (ring_mode) 0 else @intCast(lo);
++    const lo64: i64 = @intCast(lo);
+     try upload(e, ch.wlo, &lo64, 8);
+     const kv = ch.wsrc + (start - lo) * hd * 2;
+-    // slots -1: the keys go to wsrc only (ring_mode is off); the ring is written after the attention
+-    if (!ring_mode) try tri_norm.kvNormRope(e.t, ch.y, lay.kv_norm, rope.cos, rope.sin, ch.pos, ring, ring_rows, ch.neg, c.eps, true, rd, kv, n, hd);
++    // slots -1: the keys go to wsrc only; the ring is written after the attention
++    try tri_norm.kvNormRope(e.t, ch.y, lay.kv_norm, rope.cos, rope.sin, ch.pos, ring, ring_rows, ch.neg, c.eps, true, rd, kv, n, hd);
+     var comp: tri_attn.Comp = .none;
+     var n_idx: usize = 0;
+     var padded = false;
+@@ -1096,11 +1084,11 @@
+         .h = hl,
+         .hd = hd,
+         .sink = lay.sink,
+-        .wsrc = if (ring_mode) ring else ch.wsrc,
++        .wsrc = ch.wsrc,
+         .wsrc_rows = wsrc_rows,
+         .wlo = ch.wlo,
+-        .ring = ring_mode,
+-        .parts = .{ .pm = ch.pm_, .pl = ch.pl_, .po = ch.po_ },
++        .ring = false,
++        .prompt = true,
+         .comp = comp,
+         .idx = if (n_idx > 0) (if (padded) ch.cidxp else ch.cidx) else 0,
+         .n_idx = n_idx,
+@@ -1109,8 +1097,8 @@
+         .window = c.window,
+     });
+     try tri_norm.ropeHeads(e.t, ch.o, rope.cos, rope.sin, ch.pos, rd, true, n, hl, hd);
+-    // ring[pos[-keep:] % R] = kv[-keep:] (ring mode wrote them before the attention)
+-    const keep: usize = if (ring_mode) 0 else @min(n, ring_rows);
++    // ring[pos[-keep:] % R] = kv[-keep:] (the attention read them from wsrc)
++    const keep: usize = @min(n, ring_rows);
+     if (keep > 0) {
+         var idx: [256]i64 = undefined;
+         for (0..keep) |j| idx[j] = @intCast((start + n - keep + j) % ring_rows);
+@@ -1783,8 +1771,7 @@
+     } else {
+         if (e.two) |two| try two.quarters(e, ch.ek, ch.ekg, n, two.ew, 4) else try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);
+         if (prof) eh.p_x += lap(e, eh, &tq);
+-        if (e.world != 2) return notPorted(@src()); // Comm.sum of more ranks: acc += g[r]
+-        try e.ops.add2Bf16(e.s, ch.ekg, ch.ekg + n * en * 4, ch.kv, n * en);
++        try e.ops.addNBf16(e.s, ch.ekg, e.world, n * en, ch.kv, n * en);
+     }
+     try tri_basic.engramGate(e.t, ch.h, ch.kv, lay.engram_qk, ch.h_alt, c.eps, n, c.hidden);
+     swapStreams(ch, ch.h_alt);
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/prompt2d.zig src/engine/zig/src/families/dsv41/prompt2d.zig
+--- src/engine-baseline/zig/src/families/dsv41/prompt2d.zig	2026-11-01 19:00:15.537622289 +0100
++++ src/engine/zig/src/families/dsv41/prompt2d.zig	2026-11-01 18:50:28.000000000 +0100
+@@ -30,10 +30,10 @@
+ 
+ const nccl = cuda.nccl;
+ 
+-/// The split of node `g` of `world` nodes: TP over 1 or 2, the 2D split over 4.
++/// The split of node `g` of `world` nodes: plain TP over 1, 2 or 3, the 2D split over 4.
+ pub fn split(g: u32, world: u32) !plan.Split {
+     return switch (world) {
+-        1, 2 => .{ .rank = g, .world = world },
++        1, 2, 3 => .{ .rank = g, .world = world },
+         4 => .{ .rank = g % 2, .world = 2, .pair = g / 2 },
+         else => error.UnsupportedWorld,
+     };
+@@ -697,9 +697,11 @@
+     }
+ };
+ 
+-test "a node's split: TP over two, the 2D split over four" {
++test "a node's split: TP over one, two or three, the 2D split over four" {
+     try std.testing.expectEqual(plan.Split{ .rank = 1, .world = 2 }, try split(1, 2));
++    try std.testing.expectEqual(plan.Split{ .rank = 0, .world = 3 }, try split(0, 3));
++    try std.testing.expectEqual(plan.Split{ .rank = 2, .world = 3 }, try split(2, 3));
+     try std.testing.expectEqual(plan.Split{ .rank = 0, .world = 2, .pair = 1 }, try split(2, 4));
+     try std.testing.expectEqual(plan.Split{ .rank = 1, .world = 2, .pair = 1 }, try split(3, 4));
+-    try std.testing.expectError(error.UnsupportedWorld, split(0, 3));
++    try std.testing.expectError(error.UnsupportedWorld, split(0, 5));
+ }
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/rank_cache_main.zig src/engine/zig/src/families/dsv41/rank_cache_main.zig
+--- src/engine-baseline/zig/src/families/dsv41/rank_cache_main.zig	2026-11-01 19:00:15.461723074 +0100
++++ src/engine/zig/src/families/dsv41/rank_cache_main.zig	2026-11-01 22:25:47.000000000 +0100
+@@ -42,13 +42,14 @@
+             return 2;
+         }
+     }
+-    if (!(world == 1 or world == 2 or world == 4) or rank >= world or (parity and world != 4)) {
+-        std.debug.print("WORLD is 1, 2 or 4, RANK below it; --parity needs WORLD 4\n{s}", .{usage});
++    if (!(world == 1 or world == 2 or world == 3 or world == 4) or rank >= world or (parity and world != 4)) {
++        std.debug.print("WORLD is 1, 2, 3 or 4, RANK below it; --parity needs WORLD 4\n{s}", .{usage});
+         return 2;
+     }
+     // four ranks: the exact 2D split (node g = TP2 rank g % 2 of pair g / 2); the file is still rank g of 4
+     const split: dsv41.plan.Split = if (world == 4) .{ .rank = rank % 2, .world = 2, .pair = rank / 2, .parity = parity } else .{ .rank = rank, .world = world };
+     const cfg = try dsv41.Config.read(a, io, args[1]);
++    try cfg.checkWorld(world);
+     const want = try dsv41.plan.wants(a, cfg, split, dspark);
+     var sh = try dsv41.checkpoint.Shards.open(gpa, io, args[1]);
+     defer sh.close(io);
+@@ -95,22 +96,32 @@
+         return 1;
+     } else |err| if (err != error.NoRankCache) return err;
+     const partial = try std.fmt.allocPrint(a, ".rank{d}of{d}.partial", .{ rank, world });
+-    var file = try dir.createFile(io, partial, .{});
++    var file = try dir.createFile(io, partial, .{ .read = true, .truncate = false });
+     var file_open = true;
+     defer if (file_open) file.close(io);
+-    errdefer dir.deleteFile(io, partial) catch {};
+-    var wbuf: [1 << 20]u8 = undefined;
+-    var fw = file.writer(io, &wbuf);
+-    const w = &fw.interface;
++    // Resume a partial written by an earlier run (a reboot, a stop): entries are written in plan order, so the file's
++    // size identifies the last complete entry. Overwrite the possibly half-written entry and continue from there.
++    const old_end = (try file.stat(io)).size;
++    if (old_end > total) {
++        std.debug.print("{s}: partial is {d} bytes, longer than the {d} data bytes: remove it\n", .{ partial, old_end, total });
++        return 1;
++    }
++    var start: usize = 0;
++    var at: u64 = 0;
++    for (slices, 0..) |s, i| {
++        if (at + s.bytes > old_end) break;
++        at += s.bytes;
++        start = i + 1;
++    }
++    if (old_end > 0) std.debug.print("rank {d} of {d}: resuming from {d} MiB of {d} MiB\n", .{ rank, world, at >> 20, total >> 20 });
+ 
+     var buf: std.ArrayList(u8) = .empty;
+     defer buf.deinit(gpa);
+     var whole: std.ArrayList(u8) = .empty;
+     defer whole.deinit(gpa);
+     var last: ?dsv41.checkpoint.Span = null;
+-    var at: u64 = 0;
+-    var report: u64 = 8 << 30;
+-    for (want, slices) |x, s| {
++    var report: u64 = at + (8 << 30);
++    for (want[start..], slices[start..]) |x, s| {
+         // each source tensor in one read (its parts' keys follow one another): slicing it through the map would read
+         // the disk a row at a time
+         const sp = try dsv41.checkpoint.span(&sh, x.key);
+@@ -121,19 +132,20 @@
+         }
+         try buf.resize(gpa, s.bytes);
+         try dsv41.checkpoint.readFrom(&sh, x.key, whole.items, buf.items);
+-        try w.writeAll(buf.items);
++        try file.writePositionalAll(io, buf.items, at);
+         at += s.bytes;
+         if (at >= report) {
+             std.debug.print("rank {d} of {d}: {d} of {d} MiB\n", .{ rank, world, at >> 20, total >> 20 });
+             report += 8 << 30;
+         }
+     }
+-    try w.writeAll(body);
++    const data_bytes = at;
++    const tail_at = data_bytes + body.len;
++    try file.writePositionalAll(io, body, data_bytes);
+     var tail: [16]u8 = undefined;
+-    std.mem.writeInt(u64, tail[0..8], at, .little);
++    std.mem.writeInt(u64, tail[0..8], data_bytes, .little);
+     @memcpy(tail[8..], dsv41.rank_cache.magic);
+-    try w.writeAll(&tail);
+-    try w.flush();
++    try file.writePositionalAll(io, &tail, tail_at);
+     try file.sync(io);
+     file.close(io);
+     file_open = false;
+@@ -143,7 +155,7 @@
+     const hex = std.fmt.bytesToHex(digest, .lower);
+     const name = try std.fmt.allocPrint(a, "rank{d}of{d}-{s}.bin", .{ rank, world, hex[0..20] });
+     try dir.rename(partial, dir, name, io);
+-    try out.interface.print("{{\"file\": \"{s}\", \"entries\": {d}, \"data_bytes\": {d}, \"index_bytes\": {d}, \"rank\": {d}, \"world\": {d}, \"parity\": {}, \"dspark\": {}}}\n", .{ name, want.len, at, body.len, rank, world, parity, dspark });
++    try out.interface.print("{{\"file\": \"{s}\", \"entries\": {d}, \"data_bytes\": {d}, \"index_bytes\": {d}, \"rank\": {d}, \"world\": {d}, \"parity\": {}, \"dspark\": {}}}\n", .{ name, want.len, data_bytes, body.len, rank, world, parity, dspark });
+     try out.interface.flush();
+     return 0;
+ }
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/round.zig src/engine/zig/src/families/dsv41/round.zig
+--- src/engine-baseline/zig/src/families/dsv41/round.zig	2026-11-01 19:00:15.547227348 +0100
++++ src/engine/zig/src/families/dsv41/round.zig	2026-11-02 02:03:56.093404986 +0100
+@@ -106,6 +106,7 @@
+     inputs: u64,
+     ids: u64 = 0,
+     pos: u64 = 0,
++    pos_a: u64 = 0, // int64 [R] at a 256-byte arena address: the same positions, for kernels specialized for 16
+     zero: u64, // int64 [1] = 0: m._zero, sparse_attn's WLO in ring mode
+     // the streams and the mHC state
+     h: u64,
+@@ -229,8 +230,9 @@
+         rd.kk = 0;
+         rd.glue = try a.take(glue_n * max_rows * 8); // glue rows at max_rows apart
+         rd.inputs = try a.take(5 * R * 8);
++        rd.pos_a = try a.take(R * 8);
+         rd.ids = rd.inputs;
+-        rd.pos = rd.inputs;
++        rd.pos = rd.pos_a;
+         rd.zero = try a.take(8);
+         try prompt.fill(e, rd.zero, 0, 8);
+         rd.h = try a.take(R * hc * d * 2);
+@@ -541,8 +543,9 @@
+         in[4 * R + i] = rows.endOf(i);
+     }
+     try prompt.upload(e, rd.inputs, &in, 5 * R * 8);
++    try prompt.upload(e, rd.pos_a, &in[R], R * 8);
+     rd.ids = rd.inputs;
+-    rd.pos = rd.inputs + R * 8;
++    rd.pos = rd.pos_a;
+ }
+ 
+ /// The layer's RoPE table rows (model.py _cs: the compressed table for a compressed layer).
+@@ -1176,8 +1179,7 @@
+             const en = if (e.two) |tw| tw.engramWidth() else ew.n;
+             if (e.two) |tw| try tw.quarters(e, rd.ek, rd.ekg, R, tw.ew, 4) else try e.gatherF32(rd.ek, rd.ekg, R * ew.n);
+             try Probe.check(probe, .engram_gather, l, rd.ekg);
+-            if (e.world != 2) return notPorted(@src());
+-            try e.ops.add2Bf16(e.s, rd.ekg, rd.ekg + R * en * 4, rd.ekv, R * en);
++            try e.ops.addNBf16(e.s, rd.ekg, e.world, R * en, rd.ekv, R * en);
+             try tri_basic.engramGate(t, h, rd.ekv, lay.engram_qk, spare, c.eps, R, d);
+             std.mem.swap(u64, &h, &spare);
+             try rd.mark(e, .engram);
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/tri.zig src/engine/zig/src/families/dsv41/tri.zig
+--- src/engine-baseline/zig/src/families/dsv41/tri.zig	2026-11-01 19:00:15.462723075 +0100
++++ src/engine/zig/src/families/dsv41/tri.zig	2026-11-02 01:37:50.512015174 +0100
+@@ -35,6 +35,16 @@
+     return u((a + b - 1) / b);
+ }
+ 
++
++/// The head block a kernel takes: the largest power of two up to 16 that divides h (24 -> 8, 32 -> 16).
++pub fn headBlock(h: usize) usize {
++    if (h % 16 == 0) return 16;
++    if (h % 8 == 0) return 8;
++    if (h % 4 == 0) return 4;
++    if (h % 2 == 0) return 2;
++    return 1;
++}
++
+ pub fn pow2(n: usize) usize {
+     return std.math.ceilPowerOfTwo(usize, @max(n, 1)) catch unreachable;
+ }
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/tri_attn.zig src/engine/zig/src/families/dsv41/tri_attn.zig
+--- src/engine-baseline/zig/src/families/dsv41/tri_attn.zig	2026-11-01 19:00:15.462723075 +0100
++++ src/engine/zig/src/families/dsv41/tri_attn.zig	2026-11-02 10:38:46.917490123 +0100
+@@ -62,6 +62,8 @@
+     /// per-row ring / compressed row bases, int64 [rows] (concurrent rounds and batched drafts: rings only)
+     wbase: ?u64 = null,
+     cbase: ?u64 = null,
++    /// a prompt chunk: one pass whatever its row count (a chunk's rows are a chunk's, not a round's)
++    prompt: bool = false,
+     /// a pool's ring size (0: none, wsrc's rows)
+     ring_rows: usize = 0,
+     rot: ?Rot = null,
+@@ -71,7 +73,7 @@
+ 
+ /// sparse_attn: q -> out (o [R, H, HD]); window keys from wsrc, compressed keys comp[idx[r, j]].
+ pub fn sparseAttn(t: Tri, a: Attn) !void {
+-    const hb = 16;
++    const hb = tri.headBlock(a.h);
+     const bn = 32;
+     const has = a.comp != .none and a.n_idx > 0;
+     const pack = has and a.comp == .fp4;
+@@ -83,7 +85,7 @@
+     const csc: u64 = if (pack) a.comp.fp4.scales else a.wsrc;
+     const ct: []const u8 = if (pack) "*u8" else "*bf16";
+     var n_idx: usize = if (has) a.n_idx else 0;
+-    const sp: usize = if (a.rows <= tri.decode_rows) attn_splits else 1;
++    const sp: usize = if (a.rows <= tri.decode_rows and !a.prompt) attn_splits else 1;
+     const groups = a.h / hb;
+     const final = sp == 1;
+     var picks: usize = if (has) tri.cdiv(n_idx, bn) else 0;
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/tri_norm.zig src/engine/zig/src/families/dsv41/tri_norm.zig
+--- src/engine-baseline/zig/src/families/dsv41/tri_norm.zig	2026-11-01 19:00:15.462723075 +0100
++++ src/engine/zig/src/families/dsv41/tri_norm.zig	2026-11-02 01:37:50.512805940 +0100
+@@ -74,7 +74,7 @@
+ 
+ /// rope_heads: RoPE (inverse: the inverse rotation) on the last rd dims of every head of x [R, H, HD] bf16, in place.
+ pub fn ropeHeads(t: Tri, x: u64, cos: u64, sin: u64, pos: u64, rd: usize, inverse: bool, rows: usize, h: usize, hd: usize) !void {
+-    const hb = @min(h, 16);
++    const hb = tri.headBlock(h);
+     try t.run("_rope_heads", .{ u(rows), u(h / hb), 1 }, &.{ p("X", "*bf16", x), p("COS", "*fp32", cos), p("SIN", "*fp32", sin), p("POS", "*i64", pos) }, &.{ ci("H", h), ci("HD", hd), ci("RD", rd), cb("INV", inverse), ci("HB", hb), t.pdlConst() });
+ }
+ 
+diff -ruN '--exclude=.git' '--exclude=.zig-cache' '--exclude=zig-out' src/engine-baseline/zig/src/families/dsv41/weights.zig src/engine/zig/src/families/dsv41/weights.zig
+--- src/engine-baseline/zig/src/families/dsv41/weights.zig	2026-11-01 19:00:15.551209782 +0100
++++ src/engine/zig/src/families/dsv41/weights.zig	2026-11-01 19:18:04.000000000 +0100
+@@ -397,6 +397,8 @@
+     host: std.ArrayList(u8) = .empty,
+     aux: std.ArrayList(u8) = .empty,
+     wo_a_fp8: bool = false, // blockNative: wo_a's groups as their FP8 rows (the drafter's blocks), not bf16
++    heads: usize = 0, // the config's physical heads: a padded TP3 attention sink is grown to it
++    cfg: Config = undefined, // the padded TP3 vocabulary the Markov head / embed are grown to (DSpark)
+ 
+     fn upload(L: *Loader, name: []const u8, bytes: []const u8) !u64 {
+         var b = try cuda.DeviceBuffer.alloc(L.d, bytes.len);
+@@ -414,10 +416,37 @@
+         return L.host.items;
+     }
+ 
+-    /// plain(name, dtype).cuda(): the entry as it is.
++    /// plain(name, dtype).cuda(): the entry as it is. A padded TP3 config's attention sink is [heads] f32 while the
++    /// checkpoint's is [64]; the tail is zero (its heads are virtual and their wo_a group is zero).
+     fn plain(L: *Loader, tensor: []const u8, dtype: ?rank_cache.DType) !u64 {
+         var kb: [256]u8 = undefined;
+-        return L.upload(tensor, try L.entry(try plan.plainKey(&kb, tensor, dtype)));
++        const bytes = try L.entry(try plan.plainKey(&kb, tensor, dtype));
++        if (L.heads != 0 and bytes.len % 4 == 0 and bytes.len < L.heads * 4 and
++            std.mem.endsWith(u8, tensor, ".attn_sink"))
++        {
++            const need = L.heads * 4;
++            const tmp = try L.gpa.alloc(u8, need);
++            defer L.gpa.free(tmp);
++            @memset(tmp, 0);
++            @memcpy(tmp[0..bytes.len], bytes);
++            return L.upload(tensor, tmp);
++        }
++        // A padded TP3 vocabulary: draft.zig converts c.vocab * markov_rank elements of the Markov head to fp16 and the
++        // Markov loop indexes it by the padded vocabulary. Grow the two [V, markov_rank] bf16 tables with zero rows.
++        if (L.cfg.logical_vocab != 0 and
++            (std.mem.endsWith(u8, tensor, ".markov_head.head.weight") or
++            std.mem.endsWith(u8, tensor, ".markov_head.embed.weight")))
++        {
++            const need = L.cfg.vocab * L.cfg.markov_rank * 2;
++            if (bytes.len < need) {
++                const tmp = try L.gpa.alloc(u8, need);
++                defer L.gpa.free(tmp);
++                @memset(tmp, 0);
++                @memcpy(tmp[0..bytes.len], bytes);
++                return L.upload(tensor, tmp);
++            }
++        }
++        return L.upload(tensor, bytes);
+     }
+ 
+     /// linear(prefix, cols, rows): Exl3Linear.from_tensors in strips.
+@@ -1063,7 +1092,7 @@
+ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Config, s: plan.Split, dspark: bool) !Weights {
+     var w: Weights = .{ .gpa = gpa };
+     errdefer w.deinit();
+-    var L: Loader = .{ .gpa = gpa, .d = d, .src = src, .w = &w };
++    var L: Loader = .{ .gpa = gpa, .d = d, .src = src, .w = &w, .heads = c.heads, .cfg = c };
+     var pf: Prefetch = undefined;
+     var pf_on = false;
+     if (src == .cache and Prefetch.on()) {
